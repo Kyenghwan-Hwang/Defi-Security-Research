@@ -2,7 +2,7 @@
 
 **Target:** `Morpho.sol` (Morpho Blue V1, commit `d49b87f`)  
 **Date:** May 2026  
-**Context:** DeFiScan v2 report verification (Upside Academy)  
+**Context:** DeFiScan v2 report verification 
 **Tool:** Slither 0.10.x
 
 ---

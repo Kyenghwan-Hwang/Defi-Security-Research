@@ -1,97 +1,97 @@
-# Flying Tulip (ftPUT) — 발견 항목 + 판단 근거
+# Flying Tulip (ftPUT) - Findings + Reasoning
 
-> **최종 판정:** 비특권 공격자가 현 프로덕션에서 자금을 잃게 만드는 **Critical / High / Medium 취약점 없음.**
-> 아래 5개(FT-01~05)는 전부 **informational** — 손실 도달성이 없거나(별도 drain 전제), 신뢰 롤 소관이거나,
-> 실제 vault가 무력화. **바운티 제출용이 아니라 팀 informational 공유용.**
+> **Final verdict:** **No Critical / High / Medium vulnerability** allowing an unprivileged attacker to lose funds on current production.
+> The 5 items below (FT-01~05) are all **informational** - either no loss is reachable (they presuppose a separate drain),
+> they fall under trusted roles, or the real vaults neutralize them. **For team informational sharing, not for bounty submission.**
 
 ---
 
-## 판단 프레임
+## Judgment framework
 
-바운티에서 Medium 이상이 되려면: **비특권 공격자 + 신뢰 롤 오작동에 기대지 않고 + 실제 배포 상태에서 자금 손실(또는 장기 동결) + 동작 PoC.**
-5개 항목이 각각 어디서 이 문턱을 못 넘는지 명시했다.
+To reach Medium or above in this bounty: **an unprivileged attacker + not relying on trusted-role misbehavior + a loss of funds (or long-term freeze) in the actual deployed state + a working PoC.**
+Each item is annotated with where it fails to clear this bar.
 
-| ID | 제목 | 실제 손실 PoC? | 제출 불가 사유 | 등급 |
+| ID | Title | Real loss PoC? | Reason not submittable | Rating |
 |---|---|---|---|---|
-| FT-01 | CB elastic 버퍼 한도 증폭 (21x) | ❌ | 별도 drain + 자본 잠금 전제, 플래시론 불가. elastic은 ERC-7265 설계상 의도 | Info |
-| FT-02 | CB fail-open + 버퍼 롤백 | ❌ | 트리거(amount>preTvl)가 divest로 도달 불가. fail-open은 인터페이스에 명시된 의도 | Info |
-| FT-03 | 소형 3풀 CB 미설정 (`circuitBreaker=0`) | ❌ | strategyManager(신뢰 롤) 소관 → 규정상 informational | Info |
-| FT-04 | SparkSavingsStrategy 스코프 불일치 | ❌ | 버그 아님 (범위 문의) | Info |
-| FT-05 | Spark deposit 슬리피지/minShares 부재 (ERC4626 inflation) | ✅ (fresh vault) | 실제 vault가 성숙 + 내부회계 → 도달 불가 | Info |
+| FT-01 | CB elastic buffer limit amplification (21x) | ❌ | Presupposes a separate drain + locked capital, not flash-loanable. elastic is intended per ERC-7265 | Info |
+| FT-02 | CB fail-open + buffer rollback | ❌ | Trigger (amount>preTvl) not reachable via divest. fail-open is documented as intended in the interface | Info |
+| FT-03 | 3 small pools with CB unset (`circuitBreaker=0`) | ❌ | strategyManager (trusted role) responsibility → informational per the rules | Info |
+| FT-04 | SparkSavingsStrategy scope mismatch | ❌ | Not a bug (scope question) | Info |
+| FT-05 | Spark deposit missing slippage/minShares (ERC4626 inflation) | ✅ (fresh vault) | Real vaults are mature + internal accounting → not reachable | Info |
 
 ---
 
-## FT-01 — CircuitBreaker elastic 버퍼가 인출 한도를 예치액만큼 증폭
+## FT-01 - CircuitBreaker elastic buffer inflates the withdrawal limit 1:1 with deposits
 
-**대상:** `CircuitBreaker.recordInflow` (`elasticBuffer += amount`), `ftYieldWrapper.deposit`
-**입증:** `CBInvariant.t.sol::test_A_elasticInflatesRateLimit`
+**Target:** `CircuitBreaker.recordInflow` (`elasticBuffer += amount`), `ftYieldWrapper.deposit`
+**Demonstrated:** `CBInvariant.t.sol::test_A_elasticInflatesRateLimit`
 
-CB 실효 한도 = `5%·TVL + (최근 2h 예치액)`. TVL 규모를 예치하면 한도가 5% → 105%로 **21배** 증폭(실측). 팀의 "1시간 대응" 가정을 약화.
+Effective CB limit = `5% of TVL + (deposits in the last 2h)`. Depositing a TVL-sized amount inflates the limit from 5% → 105% (**21x**, measured). Weakens the team's "1-hour response" assumption.
 
-**판단 — 왜 Info인가:** 단독 손실 0. elastic 용량을 drain에 쓰려면 **동일 담보를 잠가야** 하고 되찾으려면 또 용량 필요 → 같은 tx 내 `invest→drain→divest 회수`가 rate-limit에 다시 걸려 **플래시론 불가**. 증폭기이지 자금 생성 아님. + elastic 버퍼는 ERC-7265의 의도된 deposit-tracking 동작.
-**패치:** `available` 계산 시 elastic 기여를 `cap * K`로 클램프, 또는 절대 per-window 상한 도입.
-
----
-
-## FT-02 — CircuitBreaker fail-open + 언더플로우 시 버퍼 롤백
-
-**대상:** `ftYieldWrapper.withdraw:494 / withdrawUnderlying:595` (`} catch {}`), `CircuitBreaker.checkAndRecordOutflow:154` (`preTvl - amount`)
-**입증:** `CBInvariant.t.sol::test_B_failOpen_bufferRollback` (버퍼 롤백 확인), `test_B2_wrapperInputsAreSafe`
-
-wrapper가 CB revert를 `catch{}`로 삼킴(fail-open). CB는 버퍼 차감 후 `emit Outflow(…, preTvl - amount)`에서 `amount > preTvl`이면 언더플로우 revert → 차감이 롤백 → rate-limit 미갱신. 해당 대역 반복 인출로 limiter 무력화.
-
-**판단 — 왜 Info:** `amount ≤ collateralSupply ≈ preTvl`이라 divest 경로로 **언더플로우 브랜치 도달 불가**(test_B2). 현재 트리거 불가. fail-open도 인터페이스 주석에 "designed for fail-open"으로 명시된 의도. 잠재 결함일 뿐.
-**패치:** (1) `postTvl = amount > preTvl ? 0 : preTvl - amount` 로 언더플로우 제거(무해, 반드시). (2) rate-limit 판정은 fail-closed로.
+**Reasoning - why Info:** zero standalone loss. To consume elastic capacity for a drain the attacker must **lock equal collateral**, and recovering it needs capacity again → an in-tx `invest→drain→divest-back` is again rate-limited, so **flash-loans do not work**. It's an amplifier, not fund creation. + the elastic buffer is the intended ERC-7265 deposit-tracking behavior.
+**Fix:** clamp the elastic contribution to `cap * K` in the `available` computation, or add an absolute per-window ceiling.
 
 ---
 
-## FT-03 — 프로덕션 3개 풀의 wrapper에 CircuitBreaker 미연결
+## FT-02 - CircuitBreaker fail-open + buffer rollback on underflow
 
-**대상:** `ftYieldWrapper.setCircuitBreaker` (0 허용), 라이브 상태
-**입증:** 온체인 조회 — USDS/USDtb/USDe wrapper `circuitBreaker() == 0x0`
+**Target:** `ftYieldWrapper.withdraw:494 / withdrawUnderlying:595` (`} catch {}`), `CircuitBreaker.checkAndRecordOutflow:154` (`preTvl - amount`)
+**Demonstrated:** `CBInvariant.t.sol::test_B_failOpen_bufferRollback` (buffer rollback confirmed), `test_B2_wrapperInputsAreSafe`
 
-세 풀은 rate-limit이 전무. 별도 drain 시 CB 감속 없이 즉시 전액 인출 가능. FT-02의 fail-open과 결합하면 CB 부재가 은폐.
+The wrapper swallows a CB revert with `catch{}` (fail-open). The CB decrements the buffers, then in `emit Outflow(…, preTvl - amount)` it underflows and reverts if `amount > preTvl` → the decrement is rolled back → the rate limit isn't updated. Repeating withdrawals in that band neuters the limiter.
 
-**판단 — 왜 Info:** CB 설정은 strategyManager(**완전 신뢰 롤**) 소관 → 바운티 규정상 informational. 소형 풀(~$74k 합계). 손실 프리미티브 없음.
-**권고:** strategyManager가 세 wrapper에 `setCircuitBreaker(CB)` 호출.
-
----
-
-## FT-04 — SparkSavingsStrategy가 감사 파일 목록 밖 (스코프 문의)
-
-**대상:** 배포 전략 (USDC/WETH/USDT 대형 3풀, ~$49M)
-**입증:** 온체인 — strategy(0)이 `SparkSavingsStrategy`(스코프엔 `AaveStrategy.sol`만 명시)
-
-자금 대부분을 운용하는 코드가 감사 파일 목록에 없음 → 커버리지/판정 리스크. (버그 아님)
-
-**권고:** 판정팀에 스코프 포함 여부 문의. 포함이면 ERC4626 연동부(share 반올림·유동성·in-kind 인출) 집중 검토.
+**Reasoning - why Info:** since `amount ≤ collateralSupply ≈ preTvl`, the underflow branch is **not reachable via divest** (test_B2). Currently not triggerable. fail-open is also documented as intended in the interface comment ("designed for fail-open"). A latent defect only.
+**Fix:** (1) remove the underflow with `postTvl = amount > preTvl ? 0 : preTvl - amount` (harmless, must-do). (2) make the rate-limit decision fail-closed.
 
 ---
 
-## FT-05 — SparkSavingsStrategy.deposit에 슬리피지/minShares 보호 없음 (ERC4626 inflation)
+## FT-03 - 3 production pools have no CircuitBreaker wired to the wrapper
 
-**대상:** `SparkSavingsStrategy.deposit` (`vault.deposit(amount, this)` — 받는 share 검증 없음)
-**입증:** `SparkInflationPoC.t.sol` — fresh vault: 1M 예치 → 회수 990k(**10k 손실**) / 성숙 vault($300M): 1 wei
-+ end-to-end 퍼저(`SparkInvariant`)가 `invest → 기부 → deployIdle` 시퀀스를 자율 발견해 ~8,961 USDC 부족 재현
+**Target:** `ftYieldWrapper.setCircuitBreaker` (allows 0), live state
+**Demonstrated:** on-chain query - USDS/USDtb/USDe wrappers have `circuitBreaker() == 0x0`
 
-vault share 가격이 부풀려진 상태에서 대규모 예치 시 반올림으로 프로토콜이 손실. 잘 알려진 ERC4626 donation/inflation 표면.
+Those three pools have no rate limit at all. With a separate drain, full withdrawal is possible immediately with no CB throttling. Combined with FT-02's fail-open, the missing CB is also masked.
 
-**판단 — 왜 Info (2겹으로 차단):**
-1. **현 3개 vault 모두 성숙** ($307M/$170M+/$455M) → share 가격 조작에 수억 달러 필요, 경제적 불가능.
-2. **모두 내부 회계** (`totalAssets ≫ 자체 토큰 잔액`: spUSDC 307M 보고 vs 10M USDC 보유) → **토큰 기부로 share 가격 안 움직임** → donation 공격 원천 봉쇄. (온체인 확인)
-3. 6개 wrapper 모두 전략 1개·pending 없음 → 저유동성 전략도 없음.
-
-→ **현 상태 도달 불가.** 리스크는 미래에 성숙하지 않은/naive ERC4626 vault를 온보딩할 경우에만.
-**패치:** 예치 직후 `convertToAssets(shares) + tolerance ≥ amount` 가드 추가; 신규 vault 온보딩 시 충분한 TVL 확인.
+**Reasoning - why Info:** CB configuration is the strategyManager's (**fully-trusted role**) responsibility → informational per the bounty rules. Small pools (~$74k combined). No loss primitive.
+**Recommendation:** the strategyManager should call `setCircuitBreaker(CB)` on the three wrappers.
 
 ---
 
-## 최종 판정 & 판단 근거
+## FT-04 - SparkSavingsStrategy is outside the audited file list (scope question)
 
-**제출 가능한 취약점 없음.** 5개 항목의 공통 결격 사유는 동일 — **실제 배포 상태에서 비특권 공격자가 도달 가능한 자금 손실 경로의 부재.** 정적 정독과 52개 동적 테스트가 코어 회계·가격 수학·CB·마켓·OFT·전략 전 계층의 견고함을 실증.
+**Target:** deployed strategies (the 3 large USDC/WETH/USDT pools, ~$49M)
+**Demonstrated:** on-chain - strategy(0) is `SparkSavingsStrategy` (scope only lists `AaveStrategy.sol`)
 
-**판정을 뒤집을 조건:**
-- FT-05 → 비공개 `deployments.toml`에 **저유동성/naive ERC4626 vault**가 전략 대상으로 존재 (판정 시 참조 명시됨).
-- FT-01/02/03 → **별도의 실제 drain 프리미티브**를 발견 시, CB 우회 논거로 묶어 등급을 TVL(Critical)로 격상.
+Code managing most of the funds is not in the audited file list → coverage/judging risk. (Not a bug.)
 
-**권고:** 5개 항목은 바운티 제출(각 $250 예치금 위험) 대신 **팀 informational 공유**가 적절. 특히 FT-05(전략 슬리피지 가드)와 FT-04(스코프 명확화)는 팀에 유용.
+**Recommendation:** ask the judges whether it's in scope. If included, focus on the ERC4626 integration (share rounding, liquidity, in-kind withdrawals).
+
+---
+
+## FT-05 - SparkSavingsStrategy.deposit has no slippage/minShares protection (ERC4626 inflation)
+
+**Target:** `SparkSavingsStrategy.deposit` (`vault.deposit(amount, this)` - no validation of received shares)
+**Demonstrated:** `SparkInflationPoC.t.sol` - fresh vault: deposit 1M → recover 990k (**10k loss**) / mature vault ($300M): 1 wei
++ the end-to-end fuzzer (`SparkInvariant`) autonomously discovered the `invest → donate → deployIdle` sequence, reproducing a ~8,961 USDC shortfall
+
+Depositing a large amount while the vault share price is inflated causes a rounding loss borne by the protocol. The well-known ERC4626 donation/inflation surface.
+
+**Reasoning - why Info (blocked two ways):**
+1. **All 3 current vaults are mature** ($307M/$170M+/$455M) → inflating the share price needs hundreds of millions, economically infeasible.
+2. **All use internal accounting** (`totalAssets ≫ own token balance`: spUSDC reports 307M vs holds 10M USDC) → **a token donation does not move the share price** → donation attack fundamentally blocked. (verified on-chain)
+3. All 6 wrappers have 1 strategy each, no pending → no low-liquidity strategy either.
+
+→ **Not reachable in the current state.** The risk only materializes if an immature/naive ERC4626 vault is onboarded in the future.
+**Fix:** add a `convertToAssets(shares) + tolerance ≥ amount` guard right after depositing; verify sufficient TVL when onboarding a new vault.
+
+---
+
+## Final verdict & reasoning
+
+**No submittable vulnerability.** The common disqualifier across all 5 items is the same - **the absence of a loss-of-funds path reachable by an unprivileged attacker in the actual deployed state.** Static review and 52 dynamic tests empirically demonstrate the robustness of every layer: core accounting, pricing math, CB, marketplace, OFT, strategies.
+
+**Conditions that would flip the verdict:**
+- FT-05 → a **low-liquidity/naive ERC4626 vault** exists as a strategy target in the private `deployments.toml` (which is stated to be referenced during judging).
+- FT-01/02/03 → if a **separate, real drain primitive** is found, bundle them as a CB-bypass argument to escalate the rating to TVL (Critical).
+
+**Recommendation:** rather than submitting the 5 items to the bounty (each risking a $250 deposit), **share them with the team as informational**. In particular FT-05 (strategy slippage guard) and FT-04 (scope clarification) are useful to the team.
